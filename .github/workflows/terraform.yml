@@ -64,7 +64,7 @@ jobs:
           python-version: "3.14"
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
       - name: JavaScript syntax
         run: for f in web/*.js $(ls cloudfront/*.js 2>/dev/null); do node --check "$f"; done
       # The runner image has Google Chrome; the interface tests drive it.
