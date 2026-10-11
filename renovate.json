@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "The tests run the Python of the Lambda functions (runtime python3.14 in the projects); raise both together.",
+      "matchDepNames": ["python"],
+      "allowedVersions": "<3.15"
+    }
+  ]
+}
