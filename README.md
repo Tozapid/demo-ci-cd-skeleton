@@ -36,7 +36,7 @@ jobs:
 
 | Job | When | What |
 | --- | --- | --- |
-| Terraform format and validate | always | the newest `CHANGELOG.md` entry starts with `## vX.Y.Z — YYYY-MM-DD`; `terraform fmt -check -recursive`, `terraform validate` |
+| Terraform format and validate | always | the newest `CHANGELOG.md` entry starts with `## vX.Y.Z`; `terraform fmt -check -recursive`, `terraform validate` |
 | Lambda tests | always | `python -m unittest discover -p '*_test.py'` in `lambda/` |
 | Frontend tests | always | `node --check` of `web/*.js` and `cloudfront/*.js`; `npm test` in `tests/web` with Chrome, if the project has it |
 | Plan | pull requests from the repository itself | `terraform plan` in the environment `demo`, summary in the run |
@@ -67,7 +67,7 @@ The Terraform state is `s3://$TF_STATE_BUCKET/<repository name>/terraform.tfstat
 
    The token's `sub` names the calling repository, not this one, so each project keeps its own role.
 2. In the GitHub repository: the environment `demo`, the variables `AWS_ROLE_ARN` and `TF_STATE_BUCKET`. No secrets.
-3. A `CHANGELOG.md` whose entries start with their version, newest first: `## v1.4.0 — 2026-10-12`, or with a title `## v1.4.0 — 2026-10-12 — versions`. The sites take their version from the newest entry and compare it with the releases.
+3. A `CHANGELOG.md` whose entries start with their version, newest first: `## v1.4.0`, optionally followed by a date or a title (`## v1.4.0 — 2026-10-12`, `## v1.4.0 — versions`). The sites take their version from the newest entry and compare it with the releases.
 4. The caller's job grants `contents: write` (for the release job) and `id-token: write` (for the OIDC token).
 5. The ruleset on `main` requires the checks `ci / Terraform format and validate`, `ci / Lambda tests` and `ci / Frontend tests` (the caller's job, then the job here).
 
