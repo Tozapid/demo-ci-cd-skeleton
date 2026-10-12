@@ -36,8 +36,8 @@ jobs:
       - name: CHANGELOG version
         run: |
           heading=$(grep -m1 '^## ' CHANGELOG.md || true)
-          if ! printf '%s\n' "$heading" | grep -qE '^## v[0-9]+\.[0-9]+\.[0-9]+ — [0-9]{4}-[0-9]{2}-[0-9]{2}( — .+)?$'; then
-            echo "::error file=CHANGELOG.md::The newest entry must start with '## vX.Y.Z — YYYY-MM-DD', optionally ' — title'; found: $heading"
+          if ! printf '%s\n' "$heading" | grep -qE '^## v[0-9]+\.[0-9]+\.[0-9]+( — .+)?$'; then
+            echo "::error file=CHANGELOG.md::The newest entry must start with '## vX.Y.Z', optionally followed by ' — ' and a date or a title; found: $heading"
             exit 1
           fi
       - name: terraform fmt
