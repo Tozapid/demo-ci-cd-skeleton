@@ -97,6 +97,9 @@ jobs:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     environment: demo
+    # Optional: the bucket the site's access logs go to (variable access_logs_bucket of the stack); unset is none.
+    env:
+      TF_VAR_access_logs_bucket: ${{ vars.ACCESS_LOGS_BUCKET }}
     permissions:
       contents: read
       id-token: write
@@ -133,6 +136,9 @@ jobs:
     concurrency:
       group: terraform-apply
       cancel-in-progress: false
+    # Optional: the bucket the site's access logs go to (variable access_logs_bucket of the stack); unset is none.
+    env:
+      TF_VAR_access_logs_bucket: ${{ vars.ACCESS_LOGS_BUCKET }}
     permissions:
       contents: read
       id-token: write

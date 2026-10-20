@@ -66,7 +66,7 @@ The Terraform state is `s3://$TF_STATE_BUCKET/<repository name>/terraform.tfstat
    ```
 
    The token's `sub` names the calling repository, not this one, so each project keeps its own role.
-2. In the GitHub repository: the environment `demo`, the variables `AWS_ROLE_ARN` and `TF_STATE_BUCKET`. No secrets.
+2. In the GitHub repository: the environment `demo`, the variables `AWS_ROLE_ARN` and `TF_STATE_BUCKET`, and optionally `ACCESS_LOGS_BUCKET`: plan and apply pass it to the stack as `TF_VAR_access_logs_bucket`, the bucket the site's CloudFront access logs go to (unset: none). No secrets.
 3. A `CHANGELOG.md` whose entries start with their version, newest first: `## v1.4.0`, optionally followed by a date or a title (`## v1.4.0 — 2026-10-12`, `## v1.4.0 — versions`). The sites take their version from the newest entry and compare it with the releases.
 4. The caller's job grants `contents: write` (for the release job) and `id-token: write` (for the OIDC token).
 5. The ruleset on `main` requires the checks `ci / Terraform format and validate`, `ci / Lambda tests` and `ci / Frontend tests` (the caller's job, then the job here).
