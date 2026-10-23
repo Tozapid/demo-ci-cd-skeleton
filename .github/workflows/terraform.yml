@@ -9,9 +9,25 @@ name: terraform
 # plan and apply jobs run in the environment demo and assume the role in the
 # variable AWS_ROLE_ARN, which trusts only that environment of the calling
 # repository. No AWS keys are stored.
+#
+# A pull request of the repository itself can get a preview, by hand
+# (Actions → terraform → Run workflow, with its number): the stack once more,
+# named <name>-pr<number>, with its own state. It goes when the pull request
+# is merged or closed, by hand (the same run with "destroy"), or by the daily
+# sweep: the previews of closed pull requests, those not deployed for
+# PREVIEW_DAYS, and the state locks of runs that died.
 
 on:
   workflow_call:
+    inputs:
+      preview:
+        description: Number of the pull request whose preview a manual run deploys or destroys; empty deploys the branch over the site.
+        type: string
+        default: ""
+      destroy:
+        description: Destroy the preview of that pull request instead of deploying it.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,10 +38,37 @@ env:
   TF_INPUT: "0"
   TERRAFORM_VERSION: "1.16.3"
   STATE_KEY: ${{ github.event.repository.name }}/terraform.tfstate
+  # The previews: their states sit under the project's state prefix, which
+  # the deploy role may write, as <repository>/pr-<number>/terraform.tfstate.
+  PREVIEW_PREFIX: ${{ github.event.repository.name }}/pr-
+  # The sweep destroys a preview not deployed for this many days, and drops a
+  # state lock older than this many hours.
+  PREVIEW_DAYS: "7"
+  LOCK_HOURS: "3"
+  # The default of the variable name in variables.tf, the preview's prefix.
+  NAME_DEFAULT: |
+    import re
+    match = re.search(r'variable\s+"name"\s*\{.*?default\s*=\s*"([^"]+)"', open("variables.tf").read(), re.S)
+    if not match:
+        raise SystemExit("variables.tf has no default for the variable name")
+    print(match.group(1))
+  # Writes comment.md into the comment of the preview on pull request NUMBER:
+  # one comment, edited each time.
+  PREVIEW_COMMENT: |
+    id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" --paginate \
+      --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- demo-preview -->"))) | .id' | head -1)
+    if [ -n "$id" ]; then
+      gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md >/dev/null
+    else
+      gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -F body=@comment.md >/dev/null
+    fi
 
 jobs:
   terraform:
     name: Terraform format and validate
+    if: >-
+      github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+      || (github.event_name == 'workflow_dispatch' && inputs.preview == '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,6 +92,9 @@ jobs:
 
   lambda:
     name: Lambda tests
+    if: >-
+      github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+      || (github.event_name == 'workflow_dispatch' && inputs.preview == '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -65,6 +111,9 @@ jobs:
 
   web:
     name: Frontend tests
+    if: >-
+      github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+      || (github.event_name == 'workflow_dispatch' && inputs.preview == '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -94,7 +143,7 @@ jobs:
     name: Plan
     needs: [terraform, lambda, web]
     # Pull requests from forks get no token for the environment, so only this repository's branches are planned.
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     environment: demo
     # Optional: the bucket the site's access logs go to (variable access_logs_bucket of the stack); unset is none.
@@ -129,7 +178,7 @@ jobs:
     needs: [terraform, lambda, web]
     # A push deploys main; a manual run (Actions → terraform → Run workflow) deploys
     # the branch chosen there, over the same site, until main is deployed again.
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.preview == '')
     runs-on: ubuntu-latest
     environment: demo
     # Every branch deploys the same stack: one apply at a time across branches.
@@ -179,13 +228,250 @@ jobs:
           fi
           terraform output -json | jq -r '(.site_url.value // empty), (.site_urls.value // [] | .[])' | sed 's/^/Site: /' >> "$GITHUB_STEP_SUMMARY"
 
+  # The preview of a pull request, by hand: Run workflow with its number.
+  # The code of its last push, as <name>-pr<number> (the deploy role may
+  # touch everything named with the prefix name), with its own state; its
+  # address, or the failure, in a comment on the pull request. Run it again
+  # after new pushes. Only pull requests of this repository: a fork's code
+  # would run with the role.
+  preview:
+    name: Preview
+    if: github.event_name == 'workflow_dispatch' && inputs.preview != '' && !inputs.destroy
+    runs-on: ubuntu-latest
+    environment: demo
+    concurrency:
+      group: preview-${{ inputs.preview }}
+      cancel-in-progress: false
+    # The preview sends no access logs: they would show as one more site.
+    env:
+      TF_VAR_access_logs_bucket: ""
+      NUMBER: ${{ inputs.preview }}
+      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: The pull request
+        run: |
+          case "$NUMBER" in ''|*[!0-9]*) echo "::error::preview is the number of a pull request, not '$NUMBER'"; exit 1;; esac
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER")
+          if [ "$(jq -r .state <<<"$pr")" != open ]; then
+            echo "::error::Pull request #$NUMBER is not open."
+            exit 1
+          fi
+          if [ "$(jq -r .head.repo.full_name <<<"$pr")" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::Pull request #$NUMBER comes from a fork: its code would run with the deploy role."
+            exit 1
+          fi
+          echo "HEAD_SHA=$(jq -r .head.sha <<<"$pr")" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: terraform init
+        run: |
+          echo "TF_VAR_name=$(python3 -c "$NAME_DEFAULT")-pr$NUMBER" >> "$GITHUB_ENV"
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=$PREVIEW_PREFIX$NUMBER/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION"
+      - name: terraform apply
+        run: |
+          terraform plan -no-color -out=tfplan | tee plan.txt
+          { echo "### Preview \`$TF_VAR_name\` (#$NUMBER, ${HEAD_SHA::7})"; echo '```'; grep -E '^(Plan:|No changes)|^  # ' plan.txt || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          terraform apply -no-color tfplan
+      - name: Comment the address
+        run: |
+          urls=$(terraform output -json | jq -r '(.site_url.value // empty), (.site_urls.value // [] | .[])')
+          for url in $urls; do echo "Site: $url"; done >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '<!-- demo-preview -->'
+            echo "**Preview** \`$TF_VAR_name\` of ${HEAD_SHA::7}:"
+            echo
+            for url in $urls; do echo "- $url"; done
+            echo
+            echo "Run the workflow with #$NUMBER again to update it. It goes when the pull request is merged or closed, or after $PREVIEW_DAYS days without a deploy. A new CloudFront distribution may take a few minutes to answer."
+          } > comment.md
+          bash -c "$PREVIEW_COMMENT"
+      - name: Comment the failure
+        if: failure()
+        run: |
+          printf '%s\n' '<!-- demo-preview -->' "**Preview** of #$NUMBER failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. What was made stays and goes with the pull request; run the workflow again to finish it." > comment.md
+          bash -c "$PREVIEW_COMMENT"
+
+  # Which previews to destroy: the one of a merged or closed pull request,
+  # the one asked for by hand, or, daily, those of pull requests no longer
+  # open and those not deployed for PREVIEW_DAYS. The sweep also drops the
+  # state locks of runs that died (older than LOCK_HOURS), which would stop
+  # every later run of their preview.
+  preview-targets:
+    name: Previews to destroy
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+          && github.actor != 'dependabot[bot]')
+      || (github.event_name == 'workflow_dispatch' && inputs.preview != '' && inputs.destroy)
+    runs-on: ubuntu-latest
+    environment: demo
+    outputs:
+      targets: ${{ steps.find.outputs.targets }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUCKET: ${{ vars.TF_STATE_BUCKET }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Find them
+        id: find
+        env:
+          CLOSED: ${{ github.event.pull_request.number }}
+          ASKED: ${{ inputs.preview }}
+        run: |
+          now=$(date +%s)
+          objects=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREVIEW_PREFIX" \
+            --query 'Contents[].[Key, LastModified]' --output text | grep -v '^None' || true)
+          targets='[]'
+          add() { targets=$(jq -c --arg n "$1" --arg r "$2" '. + [{number: $n, reason: $r}]' <<<"$targets"); }
+          while read -r key; do
+            number=${key#"$PREVIEW_PREFIX"}
+            number=${number%%/*}
+            case "$number" in ''|*[!0-9]*) continue;; esac
+            if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+              lock=$(awk -v k="$key.tflock" '$1 == k {print $2}' <<<"$objects")
+              if [ -n "$lock" ] && [ $(( (now - $(date -d "$lock" +%s)) / 3600 )) -ge "$LOCK_HOURS" ]; then
+                aws s3 rm "s3://$BUCKET/$key.tflock"
+                echo "- #$number: dropped a state lock of $lock" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              # Only a pull request GitHub does not know is gone; any other error skips it until the next sweep.
+              if ! state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq .state 2>error.txt); then
+                if grep -q 'HTTP 404' error.txt; then
+                  state=gone
+                else
+                  echo "- #$number: skipped, $(head -1 error.txt)" >> "$GITHUB_STEP_SUMMARY"
+                  continue
+                fi
+              fi
+              written=$(awk -v k="$key" '$1 == k {print $2}' <<<"$objects")
+              age=$(( (now - $(date -d "$written" +%s)) / 86400 ))
+              if [ "$state" != open ]; then
+                add "$number" "the pull request is $state"
+              elif [ "$age" -ge "$PREVIEW_DAYS" ]; then
+                add "$number" "not deployed for $age days"
+              fi
+            elif [ "$number" = "$CLOSED" ]; then
+              add "$number" "the pull request was closed"
+            elif [ "$number" = "$ASKED" ]; then
+              add "$number" "asked for by hand"
+            fi
+          done < <(awk '$1 ~ /\/terraform\.tfstate$/ {print $1}' <<<"$objects")
+          if [ "$targets" = '[]' ] && [ -n "$ASKED" ]; then
+            echo "No preview of #$ASKED." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          jq -r '.[] | "- #\(.number): \(.reason)"' <<<"$targets" >> "$GITHUB_STEP_SUMMARY"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  # Each preview found: terraform destroy with the code of its pull request's
+  # last push, then its state. A resource kept from being destroyed
+  # (prevent_destroy) is dropped from the state first when it lives only
+  # there (random_*, tls_*, time_*), so nothing is left behind in AWS; any
+  # other one stops the job, and the sweep tries again the next day. The
+  # comment on the pull request says what happened.
+  preview-destroy:
+    name: Destroy preview
+    needs: preview-targets
+    if: needs.preview-targets.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    environment: demo
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.preview-targets.outputs.targets) }}
+    concurrency:
+      group: preview-${{ matrix.target.number }}
+      cancel-in-progress: false
+    env:
+      TF_VAR_access_logs_bucket: ""
+      NUMBER: ${{ matrix.target.number }}
+      REASON: ${{ matrix.target.reason }}
+      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      # The head of a pull request stays fetchable after its branch is deleted.
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ matrix.target.number }}/head
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: terraform init
+        run: |
+          echo "TF_VAR_name=$(python3 -c "$NAME_DEFAULT")-pr$NUMBER" >> "$GITHUB_ENV"
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=$PREVIEW_PREFIX$NUMBER/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION"
+      - name: terraform destroy
+        run: |
+          for _ in 1 2 3 4 5; do
+            if terraform plan -destroy -no-color -out=destroy.tfplan > plan.txt 2>&1; then
+              break
+            fi
+            cat plan.txt
+            held=$(grep -oE 'Resource [^ ]+ has lifecycle.prevent_destroy' plan.txt | awk '{print $2}' | sort -u)
+            [ -n "$held" ] || exit 1
+            for address in $held; do
+              if ! printf '%s\n' "$address" | grep -qE '^(module\.[^.]+(\["[^"]*"\])?\.)*(random|tls|time)_[a-z_]+\.'; then
+                echo "::error::$address is kept from being destroyed and is more than state; remove the preview $TF_VAR_name by hand."
+                exit 1
+              fi
+              terraform state rm "$address"
+            done
+          done
+          { echo "### Destroying preview \`$TF_VAR_name\`: $REASON"; echo '```'; grep -E '^(Plan:)|^  # ' plan.txt || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          terraform apply -no-color destroy.tfplan
+      - name: Remove the state
+        run: |
+          aws s3 rm "s3://${{ vars.TF_STATE_BUCKET }}/$PREVIEW_PREFIX$NUMBER/terraform.tfstate"
+          aws s3 rm "s3://${{ vars.TF_STATE_BUCKET }}/$PREVIEW_PREFIX$NUMBER/terraform.tfstate.tflock" || true
+      - name: Comment
+        run: |
+          printf '%s\n' '<!-- demo-preview -->' "**Preview** \`$TF_VAR_name\` destroyed: $REASON." > comment.md
+          bash -c "$PREVIEW_COMMENT"
+      - name: Comment the failure
+        if: failure()
+        run: |
+          printf '%s\n' '<!-- demo-preview -->' "**Preview** of #$NUMBER was not destroyed ($REASON): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. It still runs; the daily sweep tries again, or re-run the failed job." > comment.md
+          bash -c "$PREVIEW_COMMENT"
+
   # After main is deployed, by a push or a manual run: the newest CHANGELOG
   # entry becomes a tag and a GitHub release, once. The sites compare their
   # version with these releases.
   release:
     name: Release
     needs: apply
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.preview == ''))
     runs-on: ubuntu-latest
     permissions:
       contents: write
