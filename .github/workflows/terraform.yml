@@ -1,8 +1,10 @@
 name: terraform
 
 # The CI and deployment of the demo projects (Hide-My-Email,
-# inventory-serverless-aws, wiki-serverless-aws). Each of them calls this
-# workflow from .github/workflows/terraform.yml; see README.md.
+# inventory-serverless-aws, wiki-serverless-aws and the others). Each of them
+# calls this workflow from .github/workflows/terraform.yml; see README.md. A
+# repository that is a Terraform module deploys its demo from a directory of
+# its own (working_directory).
 #
 # It runs in the calling repository: checkout, vars, environments and the
 # OIDC token are that repository's. AWS is reached with the OIDC token: the
@@ -28,6 +30,10 @@ on:
         description: Destroy the preview of that pull request instead of deploying it.
         type: boolean
         default: false
+      working_directory:
+        description: Directory of the root module the jobs plan and apply, such as demo when the repository itself is a module; CHANGELOG.md, lambda/ and web/ stay at the top.
+        type: string
+        default: "."
 
 permissions:
   contents: read
@@ -86,6 +92,7 @@ jobs:
       - name: terraform fmt
         run: terraform fmt -check -recursive
       - name: terraform validate
+        working-directory: ${{ inputs.working_directory }}
         run: |
           terraform init -backend=false
           terraform validate
@@ -145,6 +152,9 @@ jobs:
     # Pull requests from forks get no token for the environment, so only this repository's branches are planned.
     if: github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     environment: demo
     # Optional: the bucket the site's access logs go to (variable access_logs_bucket of the stack); unset is none.
     env:
@@ -180,6 +190,9 @@ jobs:
     # the branch chosen there, over the same site, until main is deployed again.
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.preview == '')
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     environment: demo
     # Every branch deploys the same stack: one apply at a time across branches.
     concurrency:
@@ -214,7 +227,7 @@ jobs:
       # A plan that would destroy a bucket, the table or the user pool needs a person, not CI.
       - name: Refuse to destroy data
         run: |
-          if grep -E '^  # aws_(s3_bucket|dynamodb_table|cognito_user_pool)\.[a-z_]+ (will be destroyed|must be replaced)' plan.txt; then
+          if grep -E '^  # (module\.[^ ]+\.)?aws_(s3_bucket|dynamodb_table|cognito_user_pool)\.[a-z_]+(\[[^]]+\])? (will be destroyed|must be replaced)' plan.txt; then
             echo "::error::The plan destroys or replaces a bucket, the table or the user pool. Apply it by hand after checking."
             exit 1
           fi
@@ -238,6 +251,9 @@ jobs:
     name: Preview
     if: github.event_name == 'workflow_dispatch' && inputs.preview != '' && !inputs.destroy
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     environment: demo
     concurrency:
       group: preview-${{ inputs.preview }}
@@ -252,7 +268,9 @@ jobs:
       id-token: write
       pull-requests: write
     steps:
+      # Before the checkout: the working directory is not there yet.
       - name: The pull request
+        working-directory: .
         run: |
           case "$NUMBER" in ''|*[!0-9]*) echo "::error::preview is the number of a pull request, not '$NUMBER'"; exit 1;; esac
           pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER")
@@ -395,6 +413,9 @@ jobs:
     needs: preview-targets
     if: needs.preview-targets.outputs.targets != '[]'
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     environment: demo
     strategy:
       fail-fast: false
