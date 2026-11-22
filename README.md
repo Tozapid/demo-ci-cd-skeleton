@@ -63,6 +63,8 @@ jobs:
 
 A manual run (Actions → terraform → Run workflow) with `preview` empty deploys the branch picked there over the same site; the next push to `main` puts main back. Applies queue across branches.
 
+A project whose repository is a Terraform module (such as [cars-serverless-aws](https://github.com/Tozapid/cars-serverless-aws)) deploys its demo from a root module in a directory of its own: `working_directory: demo` in `with:` of the caller. `terraform validate`, plan, apply and the previews then run there, and `variables.tf` with the default of `name` is that directory's; `CHANGELOG.md`, `lambda/`, `web/` and `cloudfront/` stay at the top of the repository, and `terraform fmt` checks all of it. The guard against destroying a bucket, the table or the user pool also reads addresses inside modules.
+
 The Terraform state is `s3://$TF_STATE_BUCKET/<repository name>/terraform.tfstate`, a preview's `<repository name>/pr-<number>/terraform.tfstate`. The site address comes from the output `site_url` or `site_urls`.
 
 ### Previews
